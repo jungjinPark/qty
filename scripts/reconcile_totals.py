@@ -25,6 +25,13 @@ SUMMARY_COLUMNS = [
     "plan_pages",
 ]
 
+# ✅ 엑셀/DF 생성 시 컬럼이 보장되도록 고정 컬럼 정의
+RECON_COLUMNS = SUMMARY_COLUMNS
+
+# Raw extract(기본적으로 이 키들이 존재한다고 가정)
+PLAN_COLUMNS = ["work_name", "spec", "unit", "qty", "source_pdf", "source_page", "table_title"]
+MASTER_COLUMNS = ["work_name", "spec", "unit", "master_total_qty"]
+
 TOLERANCE = Decimal("0.001")
 
 
@@ -53,7 +60,9 @@ def write_extract_log(logs, out_path: Path) -> None:
         f.write("file,page,table_title,row_count,fail_reason\n")
         for log in logs:
             f.write(
-                f'"{log.source_pdf}",{log.source_page},"{log.table_title}",{log.row_count},"{log.fail_reason}"\n'
+                f'"{getattr(log, "source_pdf", "")}",{getattr(log, "source_page", "")},'
+                f'"{getattr(log, "table_title", "")}",{getattr(log, "row_count", "")},'
+                f'"{getattr(log, "fail_reason", "")}"\n'
             )
 
 
@@ -63,6 +72,18 @@ def write_csv(rows: list[dict[str, str]], out_path: Path) -> None:
         writer = csv.DictWriter(f, fieldnames=SUMMARY_COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _df_with_columns(pd, rows: list[dict], columns: list[str]):
+    """✅ rows가 비어도 컬럼을 보장하는 DataFrame 생성 헬퍼."""
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    # rows에 일부 컬럼이 없더라도 최종 컬럼을 강제로 맞춘다
+    df = pd.DataFrame(rows)
+    for c in columns:
+        if c not in df.columns:
+            df[c] = ""
+    return df[columns]
 
 
 def write_excel(
@@ -76,29 +97,30 @@ def write_excel(
     except Exception:
         return False
 
-    summary_counts = Counter(row["status"] for row in recon_rows)
-    plan_file_counts = Counter(row["source_pdf"] for row in plan_rows)
+    # ✅ 빈 리스트여도 status 접근/필터에서 죽지 않도록 방어
+    summary_counts = Counter((row.get("status", "") or "") for row in recon_rows)
+    plan_file_counts = Counter((row.get("source_pdf", "") or "") for row in plan_rows)
 
     summary_table = pd.DataFrame(
         [{"metric": "total_recon_items", "value": len(recon_rows)}]
-        + [{"metric": f"status_{k}", "value": v} for k, v in sorted(summary_counts.items())]
-        + [{"metric": f"plan_rows_{k}", "value": v} for k, v in sorted(plan_file_counts.items())]
+        + [{"metric": f"status_{k or 'EMPTY'}", "value": v} for k, v in sorted(summary_counts.items())]
+        + [{"metric": f"plan_rows_{k or 'EMPTY'}", "value": v} for k, v in sorted(plan_file_counts.items())]
     )
 
-    recon_df = pd.DataFrame(recon_rows)
+    recon_df = _df_with_columns(pd, recon_rows, RECON_COLUMNS)
+    plan_df = _df_with_columns(pd, plan_rows, PLAN_COLUMNS)
+    master_df = _df_with_columns(pd, master_rows, MASTER_COLUMNS)
+
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         summary_table.to_excel(writer, sheet_name="Summary", index=False)
-        recon_df[recon_df["status"] == "MISMATCH"].to_excel(
-            writer, sheet_name="Mismatches", index=False
-        )
-        recon_df[recon_df["status"] == "ONLY_IN_MASTER"].to_excel(
-            writer, sheet_name="OnlyInMaster", index=False
-        )
-        recon_df[recon_df["status"] == "ONLY_IN_PLANS"].to_excel(
-            writer, sheet_name="OnlyInPlans", index=False
-        )
-        pd.DataFrame(plan_rows).to_excel(writer, sheet_name="RawPlanExtract", index=False)
-        pd.DataFrame(master_rows).to_excel(writer, sheet_name="RawMasterExtract", index=False)
+
+        # ✅ status 컬럼이 항상 있으므로 KeyError 방지
+        recon_df[recon_df["status"] == "MISMATCH"].to_excel(writer, sheet_name="Mismatches", index=False)
+        recon_df[recon_df["status"] == "ONLY_IN_MASTER"].to_excel(writer, sheet_name="OnlyInMaster", index=False)
+        recon_df[recon_df["status"] == "ONLY_IN_PLANS"].to_excel(writer, sheet_name="OnlyInPlans", index=False)
+
+        plan_df.to_excel(writer, sheet_name="RawPlanExtract", index=False)
+        master_df.to_excel(writer, sheet_name="RawMasterExtract", index=False)
 
     return True
 
@@ -146,7 +168,7 @@ def reconcile(plan_rows: list[dict[str, str]], master_rows: list[dict[str, str]]
         if master_qty is None:
             status = "ONLY_IN_PLANS"
             master_val = Decimal("0")
-            plan_val = plan_qty
+            plan_val = plan_qty if plan_qty is not None else Decimal("0")
         elif plan_qty is None:
             status = "ONLY_IN_MASTER"
             master_val = master_qty
